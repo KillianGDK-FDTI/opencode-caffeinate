@@ -1,14 +1,30 @@
 {
   "name": "opencode-caffeinate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keep macOS awake while OpenCode works, with bounded native caffeinate leases.",
   "type": "module",
-  "exports": "./index.js",
-  "files": ["index.js"],
-  "engines": { "node": ">=20" },
+  "private": true,
+  "exports": "./index.ts",
+  "files": [
+    "index.ts",
+    "activity.ts"
+  ],
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --experimental-test-module-mocks --test test/*.test.ts",
+    "test:opencode": "node --experimental-strip-types --test test/opencode.integration.ts"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/KillianGDK-FDTI/opencode-caffeinate.git"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.29",
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
   }
 }

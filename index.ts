@@ -1,27 +1,34 @@
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcess } from "node:child_process"
+import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { createActivity, type ActivityEvent } from "./activity.ts"
 
-export default async function caffeinatePlugin({ client }, options = {}) {
+export default (async function caffeinatePlugin(
+  { client }: Pick<PluginInput, "client">,
+  options: Record<string, unknown> = {},
+) {
   if (process.platform !== "darwin") return {}
 
-  const maxSeconds = options.maxSeconds ?? 14_400
-  if (!Number.isSafeInteger(maxSeconds) || maxSeconds < 300 || maxSeconds > 2_147_483) {
+  const configuredLimit = options.maxSeconds ?? 14_400
+  if (typeof configuredLimit !== "number" || !Number.isSafeInteger(configuredLimit)
+    || configuredLimit < 300 || configuredLimit > 2_147_483) {
     throw new Error("opencode-caffeinate: maxSeconds must be an integer between 300 and 2147483")
   }
+  const maxSeconds = configuredLimit
 
-  const active = new Set()
-  const waiting = new Map()
-  const children = new Set()
-  let current
-  let started = 0
+  const activity = createActivity()
+  const children = new Set<ChildProcess>()
+  let current: ChildProcess | undefined
+  let started: number | undefined
   let renewed = 0
   let revision = 0
   let disposed = false
   let checking = false
   let exhausted = false
   let scheduled = false
-  let deadline
+  let snapshot: string | undefined
+  let deadline: ReturnType<typeof setTimeout> | undefined
 
-  function log(message) {
+  function log(message: string) {
     void client.app.log({
       body: { service: "opencode-caffeinate", level: "warn", message },
     }).catch(() => {})
@@ -35,17 +42,17 @@ export default async function caffeinatePlugin({ client }, options = {}) {
 
   function reconcile() {
     if (disposed) return
-    const working = [...active].some((id) => ![...waiting.values()].includes(id))
-    if (!working) {
+    if (!activity.isWorking()) {
       stop()
       clearTimeout(deadline)
-      started = 0
+      started = undefined
       exhausted = false
       return
     }
     if (exhausted) return
-    if (!started) {
-      started = Date.now()
+    const now = performance.now()
+    if (started === undefined) {
+      started = now
       deadline = setTimeout(() => {
         exhausted = true
         stop()
@@ -53,9 +60,9 @@ export default async function caffeinatePlugin({ client }, options = {}) {
       }, maxSeconds * 1000)
       deadline.unref()
     }
-    const remaining = Math.floor(maxSeconds - (Date.now() - started) / 1000)
+    const remaining = Math.floor(maxSeconds - (now - started) / 1000)
     if (remaining <= 0) return
-    if (current && Date.now() - renewed < 180_000) return
+    if (current && now - renewed < 180_000) return
 
     // Native expiry and PID watching still work if JS freezes or OpenCode crashes.
     const previous = current
@@ -64,11 +71,10 @@ export default async function caffeinatePlugin({ client }, options = {}) {
     ], { stdio: "ignore" })
     children.add(child)
     current = child
-    renewed = Date.now()
+    renewed = now
     child.unref()
     child.once("spawn", () => {
       if (disposed || current !== child) child.kill()
-      // Release the old assertion only after its replacement has started.
       previous?.kill()
     })
     child.once("error", () => {
@@ -85,7 +91,7 @@ export default async function caffeinatePlugin({ client }, options = {}) {
   function schedule() {
     if (disposed) return
     // Do not coalesce away an idle transition followed immediately by new work.
-    if (![...active].some((id) => ![...waiting.values()].includes(id))) {
+    if (!activity.isWorking()) {
       reconcile()
       return
     }
@@ -97,53 +103,47 @@ export default async function caffeinatePlugin({ client }, options = {}) {
     }).unref()
   }
 
-  // A failed health check never renews the lease. Discard snapshots raced by events.
+  // OpenCode publishes status events before updating its status map. Confirm a
+  // snapshot twice without intervening events before overriding event state.
   const timer = setInterval(async () => {
-    if (checking || disposed || !active.size) return
+    if (checking || disposed || !activity.hasSessions()) return
     checking = true
     const version = revision
+    const controller = new AbortController()
+    let timeout: ReturnType<typeof setTimeout> | undefined
     try {
-      const result = await client.session.status({ signal: AbortSignal.timeout(5_000) })
+      const result = await Promise.race([
+        client.session.status({ signal: controller.signal }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort()
+            reject(new Error("Status check timed out"))
+          }, 5_000)
+          timeout.unref()
+        }),
+      ])
       if (disposed || version !== revision || result.error || !result.data) return
-      active.clear()
-      for (const [id, status] of Object.entries(result.data)) {
-        if (status.type === "busy" || status.type === "retry") active.add(id)
+      const key = JSON.stringify(Object.entries(result.data).map(([id, status]) => [id, status.type]).sort())
+      if (snapshot !== key) {
+        snapshot = key
+        return
       }
-      for (const [request, id] of waiting) {
-        if (!active.has(id)) waiting.delete(request)
-      }
+      activity.reconcile(result.data)
       reconcile()
     } catch {
       // Let the native lease expire if the server stops responding.
     } finally {
+      clearTimeout(timeout)
       checking = false
     }
   }, 60_000)
   timer.unref()
 
   return {
-    event: async ({ event }) => {
-      if (disposed) return
-      const p = event.properties
-      if (event.type === "session.status") {
-        if (p.status.type === "busy" || p.status.type === "retry") active.add(p.sessionID)
-        else {
-          active.delete(p.sessionID)
-          for (const [request, id] of waiting) {
-            if (id === p.sessionID) waiting.delete(request)
-          }
-        }
-      } else if (event.type === "session.deleted") {
-        active.delete(p.info.id)
-        for (const [request, id] of waiting) {
-          if (id === p.info.id) waiting.delete(request)
-        }
-      } else if (event.type === "permission.asked" || event.type === "question.asked") {
-        waiting.set(`${event.type.split(".")[0]}:${p.id}`, p.sessionID)
-      } else if (["permission.replied", "question.replied", "question.rejected"].includes(event.type)) {
-        waiting.delete(`${event.type.split(".")[0]}:${p.requestID}`)
-      } else return
+    event: async ({ event }: { event: ActivityEvent }) => {
+      if (disposed || !activity.update(event)) return
       revision++
+      snapshot = undefined
       schedule()
     },
     dispose: async () => {
@@ -151,8 +151,7 @@ export default async function caffeinatePlugin({ client }, options = {}) {
       clearInterval(timer)
       clearTimeout(deadline)
       stop()
-      active.clear()
-      waiting.clear()
+      activity.clear()
     },
   }
-}
+}) satisfies Plugin
